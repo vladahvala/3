@@ -27,14 +27,37 @@ SQRT2 = np.sqrt(2.0)
 # ----------------------------------------------------------------------------
 # Завантаження зображення
 # ----------------------------------------------------------------------------
-def load_gray(path, size=512):
+JPEG_CROP = 4   # зсув сітки на півблока, щоб вона не збігалася із сіткою JPEG
+
+
+def load_gray(path, size=512, break_jpeg_grid=True):
     """Читає зображення, переводить у відтінки сірого і масштабує до size x size.
-    Без шляху створює синтетичне тестове зображення."""
+    Без шляху створює синтетичне тестове зображення.
+
+    Чому окремо обробляється JPEG: JPEG уже стиснутий тим самим DCT 8x8, і його
+    квантування обнулило більшість високочастотних коефіцієнтів. Якщо файл має
+    розмір рівно size x size, масштабування нічого не змінює, наші блоки 8x8
+    збігаються з блоками JPEG, і DCT отримує зображення, яке вже розріджене саме
+    в його базисі. Тоді порівняння DCT vs DWT нечесне (PSNR DCT штучно завищений).
+    Тому з JPEG обрізаємо по JPEG_CROP пікселів з кожного краю і лише потім
+    масштабуємо: сітка зсувається, а ресемплінг руйнує структуру квантування."""
     if path is None:
         return synthetic_image(size)
     from PIL import Image
-    img = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
+    src = Image.open(path)
+    img = src.convert("L")
+    if break_jpeg_grid and src.format == "JPEG":
+        w, h = img.size
+        img = img.crop((JPEG_CROP, JPEG_CROP, w - JPEG_CROP, h - JPEG_CROP))
+        print(f"JPEG: обрізано по {JPEG_CROP} px з країв перед масштабуванням, "
+              f"щоб сітка 8x8 не збігалася із сіткою JPEG (вимкнути: --keep-jpeg-grid)")
+    img = img.resize((size, size), Image.LANCZOS)
     return np.asarray(img, dtype=np.float64)
+
+
+def sparsity(coefs, eps=0.5):
+    """Частка коефіцієнтів, менших за eps за модулем (наскільки зображення вже 'розріджене')."""
+    return float(np.mean(np.abs(coefs) < eps))
 
 
 def synthetic_image(size=512):
@@ -208,7 +231,9 @@ def run_report(img, outdir, levels, fractions=LEVELS_DEFAULT):
     os.makedirs(outdir, exist_ok=True)
     print(f"\nЗображення {img.shape[0]}x{img.shape[1]}, DWT: {levels} рівні(в) Хаара, "
           f"блок DCT {BLOCK}x{BLOCK}")
-    print("Коефіцієнт стиснення = усього коефіцієнтів / збережених (це НЕ розмір файлу).\n")
+    print("Коефіцієнт стиснення = усього коефіцієнтів / збережених (це НЕ розмір файлу).")
+    print(f"Частка коефіцієнтів |c| < 0.5 ще до стиснення: DCT {sparsity(dct2_blocks(img)) * 100:.1f}%, "
+          f"DWT {sparsity(haar2(img, levels)) * 100:.1f}%\n")
     header = f"{'Збережено':>10} | {'Метод':^5} | {'Коеф.':>8} | {'Частка':>7} | {'К-сть стиснення':>15} | {'PSNR, дБ':>9}"
     print(header)
     print("-" * len(header))
@@ -241,6 +266,23 @@ def run_report(img, outdir, levels, fractions=LEVELS_DEFAULT):
         f.write("fraction,method,kept,share,ratio,psnr_db\n")
         for fr, nm, k, sh, ra, ps in rows:
             f.write(f"{fr},{nm},{k},{sh:.5f},{ra:.3f},{ps:.3f}\n")
+
+    # Збільшений фрагмент при найсильнішому стисненні: видно характер артефактів
+    frac = min(fractions)
+    res = evaluate(img, frac, levels)
+    h, w = img.shape
+    cy, cx, half = h // 2, w // 2, min(h, w) // 8
+    sl = (slice(cy - half, cy + half), slice(cx - half, cx + half))
+    fig3, ax3 = plt.subplots(1, 3, figsize=(10.5, 3.9))
+    for a, (title, im) in zip(ax3, (("Original", img),
+                                    (f"DCT {frac * 100:.0f}%  PSNR={res['DCT']['psnr']:.2f} дБ", res["DCT"]["image"]),
+                                    (f"DWT {frac * 100:.0f}%  PSNR={res['DWT']['psnr']:.2f} дБ", res["DWT"]["image"]))):
+        a.imshow(im[sl], cmap="gray", vmin=0, vmax=255, interpolation="nearest")
+        a.set_title(title, fontsize=10)
+        a.axis("off")
+    fig3.suptitle(f"Фрагмент {2 * half}x{2 * half} px у центрі, збільшено")
+    fig3.tight_layout()
+    fig3.savefig(os.path.join(outdir, "zoom.png"), dpi=110)
 
     # PSNR залежно від частки збережених коефіцієнтів
     xs = np.linspace(0.01, 0.6, 30)
@@ -383,6 +425,8 @@ def main():
     ap.add_argument("--report", action="store_true", help="таблиця і файли в папку results/, без вікна")
     ap.add_argument("--out", default="results", help="папка для --report")
     ap.add_argument("--selftest", action="store_true", help="перевірка коректності перетворень")
+    ap.add_argument("--keep-jpeg-grid", action="store_true",
+                    help="не зсувати сітку для JPEG (щоб відтворити завищений PSNR DCT)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -390,7 +434,7 @@ def main():
     if args.size % BLOCK or args.size % (2 ** args.levels):
         ap.error("size має ділитися на 8 і на 2^levels")
 
-    img = load_gray(args.image, args.size)
+    img = load_gray(args.image, args.size, break_jpeg_grid=not args.keep_jpeg_grid)
     if args.report:
         run_report(img, args.out, args.levels)
     else:
